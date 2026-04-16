@@ -41,7 +41,7 @@ jobs:
         run: npm install -g .
 
       - name: Apply tweakcc patches
-        run: tweakcc --apply --yes
+        run: tweakcc --apply
         env:
           TWEAKCC_CI: "1"
 
