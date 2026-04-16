@@ -793,7 +793,12 @@ function rebuildBunData(
     }
 
     const sourcemapBytes = getStringPointerContent(bunData, module.sourcemap);
-    const bytecodeBytes = getStringPointerContent(bunData, module.bytecode);
+    // Zero bytecode for all modules when patching: Bun 1.3.13 validates bytecode
+    // hashes against source content and aborts (SIGKILL) on mismatch. Zeroing
+    // forces Bun to parse from source instead of using stale cached bytecode.
+    const bytecodeBytes = modifiedClaudeJs
+      ? Buffer.alloc(0)
+      : getStringPointerContent(bunData, module.bytecode);
     const moduleInfoBytes = getStringPointerContent(bunData, module.moduleInfo);
     const bytecodeOriginPathBytes = getStringPointerContent(
       bunData,
@@ -1157,10 +1162,11 @@ function repackMachO(
             if (segname === '__BUN') {
               const patch = Buffer.allocUnsafe(8);
               patch.writeBigUInt64LE(newSegSize);
-              // vmsize at lcBuf[cmdOffset+24], filesize at lcBuf[cmdOffset+40]
+              // LC_SEGMENT_64 layout: cmd(4) cmdsize(4) segname(16) vmaddr(8) vmsize(8) fileoff(8) filesize(8)
+              // Within command: vmaddr=+24, vmsize=+32, fileoff=+40, filesize=+48
               // File positions: 32 (mach header) + cmdOffset + field offset
-              fs.writeSync(fd, patch, 0, 8, 32 + cmdOffset + 24); // vmsize
-              fs.writeSync(fd, patch, 0, 8, 32 + cmdOffset + 40); // filesize
+              fs.writeSync(fd, patch, 0, 8, 32 + cmdOffset + 32); // vmsize
+              fs.writeSync(fd, patch, 0, 8, 32 + cmdOffset + 48); // filesize
               debug(
                 `repackMachO: Updated __BUN segment sizes to ${newSegSize} bytes`
               );
@@ -1178,13 +1184,57 @@ function repackMachO(
     const origStat = fs.statSync(binPath);
     fs.chmodSync(outputPath, origStat.mode);
 
-    // Re-sign with ad-hoc signature
+    // Re-sign with ad-hoc signature, preserving original entitlements.
+    // Bun requires allow-jit and allow-unsigned-executable-memory entitlements
+    // to allocate JIT memory — stripping them causes SIGKILL at runtime.
     try {
       debug(`repackMachO: Re-signing binary with ad-hoc signature...`);
-      execSync(`codesign -s - -f "${outputPath}"`, {
-        stdio: isDebug() ? 'inherit' : 'ignore',
-      });
+      const entitlementsTmp = outputPath + '.entitlements.plist';
+      try {
+        execSync(
+          `codesign -d --entitlements "${entitlementsTmp}" --xml "${binPath}" 2>/dev/null || true`,
+          { stdio: isDebug() ? 'inherit' : 'ignore' }
+        );
+        const hasEntitlements = (() => {
+          try {
+            return fs.statSync(entitlementsTmp).size > 0;
+          } catch {
+            return false;
+          }
+        })();
+        if (hasEntitlements) {
+          execSync(
+            `codesign -s - -f --options=runtime --entitlements "${entitlementsTmp}" "${outputPath}"`,
+            { stdio: isDebug() ? 'inherit' : 'ignore' }
+          );
+        } else {
+          execSync(`codesign -s - -f --options=runtime "${outputPath}"`, {
+            stdio: isDebug() ? 'inherit' : 'ignore',
+          });
+        }
+      } finally {
+        try {
+          fs.unlinkSync(entitlementsTmp);
+        } catch {
+          // ignore
+        }
+      }
       debug('repackMachO: Code signing completed successfully');
+
+      // On macOS Sequoia+, Gatekeeper (ASP/syspolicyd) tracks notarization provenance
+      // and blocks ad-hoc re-signed binaries. Attempt to disable Gatekeeper screening
+      // so the modified binary can run. This requires sudo and may not succeed.
+      try {
+        execSync(
+          `sudo spctl --global-disable 2>/dev/null || sudo spctl --master-disable 2>/dev/null || true`,
+          {
+            stdio: isDebug() ? 'inherit' : 'ignore',
+          }
+        );
+        debug('repackMachO: Gatekeeper disabled');
+      } catch {
+        debug('repackMachO: Could not disable Gatekeeper (may need sudo)');
+      }
     } catch (codesignError) {
       console.warn(
         'Warning: Failed to re-sign binary. The binary may not run correctly on macOS:',
