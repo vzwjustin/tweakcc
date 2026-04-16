@@ -793,7 +793,12 @@ function rebuildBunData(
     }
 
     const sourcemapBytes = getStringPointerContent(bunData, module.sourcemap);
-    const bytecodeBytes = getStringPointerContent(bunData, module.bytecode);
+    // Zero bytecode for all modules when patching: Bun 1.3.13 validates bytecode
+    // hashes against source content and aborts (SIGKILL) on mismatch. Zeroing
+    // forces Bun to parse from source instead of using stale cached bytecode.
+    const bytecodeBytes = modifiedClaudeJs
+      ? Buffer.alloc(0)
+      : getStringPointerContent(bunData, module.bytecode);
     const moduleInfoBytes = getStringPointerContent(bunData, module.moduleInfo);
     const bytecodeOriginPathBytes = getStringPointerContent(
       bunData,
@@ -1157,10 +1162,11 @@ function repackMachO(
             if (segname === '__BUN') {
               const patch = Buffer.allocUnsafe(8);
               patch.writeBigUInt64LE(newSegSize);
-              // vmsize at lcBuf[cmdOffset+24], filesize at lcBuf[cmdOffset+40]
+              // LC_SEGMENT_64 layout: cmd(4) cmdsize(4) segname(16) vmaddr(8) vmsize(8) fileoff(8) filesize(8)
+              // Within command: vmaddr=+24, vmsize=+32, fileoff=+40, filesize=+48
               // File positions: 32 (mach header) + cmdOffset + field offset
-              fs.writeSync(fd, patch, 0, 8, 32 + cmdOffset + 24); // vmsize
-              fs.writeSync(fd, patch, 0, 8, 32 + cmdOffset + 40); // filesize
+              fs.writeSync(fd, patch, 0, 8, 32 + cmdOffset + 32); // vmsize
+              fs.writeSync(fd, patch, 0, 8, 32 + cmdOffset + 48); // filesize
               debug(
                 `repackMachO: Updated __BUN segment sizes to ${newSegSize} bytes`
               );
